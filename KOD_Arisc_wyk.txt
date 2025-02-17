@@ -1,0 +1,307 @@
+import com.dukascopy.api.*;
+import java.io.*;
+import java.util.Collections;
+import java.util.Calendar;
+import java.util.TimeZone;
+
+public class ZawadzkiSzymonARISC_LAB2 implements IStrategy {
+    private IEngine engine;//Zarządzanie zleceniami
+    private IHistory history;//Dostęp do danych historycznych
+    private IContext context;//Globalny dostęp do zasobów platformy
+    private IIndicators indicators;//Obliczanie wskaźników technicznych
+
+    private int pipsSL = 75; // Stop Loss w pipsach
+    private int pipsTP = 200; // Take Profit w pipsach
+    private double slippagePips = 0.5;//Określa dopuszczalny poślizg między oczekiwaną a rzeczywistą ceną realizacji zlecenia
+    private TradeManager tradeManager;//Zarządza składaniem zleceń i kontrolą ryzyka
+    private QLearningAgent qLearningAgent;//Uczy się optymalnych decyzji handlowych poprzez Q-learning
+
+    private static final double ALPHA = 0.1; // Współczynnik uczenia
+    private static final double GAMMA = 0.9; // Współczynnik dyskontujący
+    private static final double EPSILON = 0.1; // Współczynnik eksploracji
+    
+    
+    
+    
+    /*Metoda onStart jest pierwszą metodą, która zostaje wywołana, gdy strategia 
+    jest uruchamiana na platformie handlowej. Inicjalizuje wszystkie potrzebne 
+    zasoby i przygotowuje strategię do działania.*/
+    @Override
+    public void onStart(IContext context) throws JFException {
+        this.context = context;//
+        this.engine = context.getEngine();
+        this.history = context.getHistory();
+        this.indicators = context.getIndicators();
+        this.tradeManager = new TradeManager(engine, pipsSL, pipsTP, slippagePips);
+
+        // Subskrybuj instrument USD/SGD
+        context.setSubscribedInstruments(Collections.singleton(Instrument.USDSGD), true);
+
+        // Inicjalizuj model Q-learningu
+        qLearningAgent = new QLearningAgent(3, 3); // Liczba stanów = 3, Liczba akcji = 3
+    }
+
+
+    /*Ta metoda jest wywoływana, gdy nowy bar (świeca) jest dostępny 
+    dla określonego instrumentu i okresu. Bar zawiera informacje o cenie otwarcia, 
+    zamknięcia, najwyższej i najniższej cenie w danym okresie.*/
+    @Override
+    public void onBar(Instrument instrument, Period period, IBar askBar, IBar bid) throws JFException {
+        long time = bid.getTime();//Pobranie znacznika czasu dla danego baru
+        
+        //Sprawdzenie, czy aktualny instrument to USDSGD i czy okres to 1-godzinny
+        if (!instrument.equals(Instrument.USDSGD) || !period.equals(Period.ONE_HOUR)) return;
+
+        //Obliczenie spreadu
+        double spread = askBar.getClose() - bid.getClose();
+        
+        
+        //Tworzenie tablicy cech (features), która zawiera różne informacje o barze oraz dane analityczne
+        double[] features = {
+                bid.getOpen(), bid.getClose(), bid.getLow(), bid.getHigh(),
+                indicators.sma(Instrument.USDSGD, Period.ONE_HOUR, OfferSide.BID, IIndicators.AppliedPrice.CLOSE, 10, Filter.WEEKENDS, 1, time, 0)[0],
+                indicators.sma(Instrument.USDSGD, Period.ONE_HOUR, OfferSide.BID, IIndicators.AppliedPrice.CLOSE, 30, Filter.WEEKENDS, 1, time, 0)[0],
+                spread // Uwzględnij spread jako cechę
+        };
+
+
+        //Obliczenie stanu na podstawie cech za pomocą metody computeState 
+        int state = qLearningAgent.computeState(features);
+        
+        //Wybór akcji na podstawie stanu i współczynnika eksploracji EPSILON
+        int action = qLearningAgent.epsilonGreedyAction(state, EPSILON);
+
+        //Ustalenie typu zlecenia (BUY lub SELL) w zależności od wybranej akcji
+        IEngine.OrderCommand orderCmd = (action == 0) ? IEngine.OrderCommand.BUY : IEngine.OrderCommand.SELL;
+        
+        //Ustalenie ceny, po której zostanie złożone zlecenie
+        double price = (action == 0) ? bid.getClose() : askBar.getClose();
+
+        //Obliczenie rzeczywistej ceny z uwzględnieniem poślizgu
+        double priceWithSlippage = orderCmd == IEngine.OrderCommand.BUY ? price + slippagePips * Instrument.USDSGD.getPipValue() :
+                price - slippagePips * Instrument.USDSGD.getPipValue();
+
+        //zlecenia za pomocą TradeManager i otrzymanie nagrody za wykonane zlecenie
+        double reward = tradeManager.submitOrderAndGetReward(time, orderCmd, priceWithSlippage);
+
+        //Aktualizacja tablicy Q agenta na podstawie stanu
+        qLearningAgent.learn(state, action, reward, ALPHA, GAMMA);
+    }
+
+
+
+    /*Klasa TradeManager pełni rolę zarządzającą transakcjami, kontrolującą limity oraz obliczającą nagrody 
+    na podstawie wyników zleceń.*/
+    private static class TradeManager {
+        private final IEngine engine;//Referencja do silnika handlowego
+        private final int pipsSL;//Liczba pipsów, która definiuje stop loss (SL)
+        private final int pipsTP;//Liczba pipsów, która definiuje take profit (TP)
+        private final double slippagePips;//Poślizg w pipsach
+
+        private int tradesExecuted = 0;//Liczba wykonanych transakcji
+        private long lastTrade = 0;//Znacznik czasu ostatniej transakcji. Używane do kontrolowania okresu chłodzenia (cooldown)
+        private int monthlyBuys = 0;//Liczba transakcji kupna dokonanych w bieżącym miesiącu
+        private int monthlySells = 0;//Liczba transakcji sprzedaży dokonanych w bieżącym miesiącu
+        private int currentMonth = -1;//Numer bieżącego miesiąca
+
+        private static int _maxTradesPerMonth = 10;//Maksymalna liczba transakcji dozwolona na miesiąc
+
+        //Konstruktor inicjalizuje obiekt TradeManager 
+        public TradeManager(IEngine engine, int pipsSL, int pipsTP, double slippagePips) {
+            this.engine = engine;
+            this.pipsSL = pipsSL;
+            this.pipsTP = pipsTP;
+            this.slippagePips = slippagePips;
+        }
+
+        public double submitOrderAndGetReward(long time, IEngine.OrderCommand orderCmd, double price) throws JFException {
+            for (IOrder order : engine.getOrders(Instrument.USDSGD)) {
+                if (order.getState() == IOrder.State.OPENED || order.getState() == IOrder.State.FILLED) {
+                    if ((orderCmd == IEngine.OrderCommand.BUY && order.isLong()) ||
+                            (orderCmd == IEngine.OrderCommand.SELL && !order.isLong())) {
+                        return 0;
+                    }
+                }
+            }
+
+            if (lastTrade != 0 && time - lastTrade < Period.ONE_HOUR.getInterval() * 5) return 0;
+
+            if (getMonth(time) != currentMonth) {
+                monthlyBuys = 0;
+                monthlySells = 0;
+                currentMonth = getMonth(time);
+            }
+
+            if (orderCmd == IEngine.OrderCommand.BUY && monthlyBuys >= _maxTradesPerMonth) return 0;
+            else if (orderCmd == IEngine.OrderCommand.SELL && monthlySells >= _maxTradesPerMonth) return 0;
+
+            double stopLoss = orderCmd == IEngine.OrderCommand.BUY ? price - Instrument.USDSGD.getPipValue() * pipsSL :
+                    price + Instrument.USDSGD.getPipValue() * pipsSL;
+            double takeProfit = orderCmd == IEngine.OrderCommand.BUY ? price + Instrument.USDSGD.getPipValue() * pipsTP :
+                    price - Instrument.USDSGD.getPipValue() * pipsTP;
+
+            IOrder order = engine.submitOrder("OPERATION", Instrument.USDSGD, orderCmd, 0.1, price, 5, stopLoss, takeProfit);
+
+            tradesExecuted++;
+            if (orderCmd == IEngine.OrderCommand.BUY) monthlyBuys++;
+            else if (orderCmd == IEngine.OrderCommand.SELL) monthlySells++;
+            lastTrade = time;
+            
+            //Metoda oblicza nagrodę, która jest różnicą między ceną a poziomem stopLoss lub takeProfit, w zależności od kierunku transakcji (kupno/sprzedaż).
+            double reward = orderCmd == IEngine.OrderCommand.BUY ? price - stopLoss : takeProfit - price;
+            return reward;
+        }
+
+        private int getMonth(long time) {
+            Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
+            calendar.setTimeInMillis(time);
+            return calendar.get(Calendar.MONTH) + 1;
+        }
+    }
+
+    //Klasa QLearningAgent implementuje algorytm Q-learningu, który jest jedną z technik uczenia się przez wzmacnianie 
+    public class QLearningAgent {
+        private double[][] Q_TABLE;//Tablica Q przechowująca wartości Q dla różnych stanów i akcji
+        private final int numStates;//: Liczba możliwych stanów w środowisku
+        private final int numActions;//Liczba możliwych akcji
+        private static final String Q_TABLE_FILE = "q_table.dat"; // Nazwa pliku do zapisywania i wczytywania modelu
+    
+        // Okresy treningowy i testowy
+        private static final int TRAINING_PERIOD_END_YEAR = 2022; // Do 2022 roku
+        private static final int TESTING_PERIOD_YEAR = 2023; // Rok 2023
+    
+        private double trainingRewardSum = 0;
+        private double testingRewardSum = 0;
+        private int trainingSteps = 0;
+        private int testingSteps = 0;
+    
+        public QLearningAgent(int numStates, int numActions) {
+            this.numStates = numStates;
+            this.numActions = numActions;
+            this.Q_TABLE = new double[numStates][numActions];
+            // Wczytaj model, jeśli plik istnieje
+            loadModel();
+        }
+    
+        //Przelicza stan na podstawie cech
+        public int computeState(double[] features) {
+            int state = 0;
+            for (double feature : features) {
+                state += (int) feature;
+            }
+            return state % numStates;
+        }
+    
+        //Realizuje strategię epsilon-greedy, która z pewnym prawdopodobieństwem (epsilon) wybiera losową akcję
+        public int epsilonGreedyAction(int state, double epsilon) {
+            if (Math.random() < epsilon) {
+                return (int) (Math.random() * numActions);
+            } else {
+                return selectAction(state);
+            }
+        }
+    
+        //Aktualizuje wartości w tablicy Q na podstawie otrzymanej nagrody
+        public void learn(int state, int action, double reward, double alpha, double gamma) {
+            long currentTime = System.currentTimeMillis();
+            if (isTrainingPeriod(currentTime)) {
+                double currentQ = Q_TABLE[state][action];
+                double maxNextQ = getMaxQ(state);
+                double newQ = currentQ + alpha * (reward + gamma * maxNextQ - currentQ);
+                Q_TABLE[state][action] = newQ;
+                trainingRewardSum += reward;
+                trainingSteps++;
+            } else if (isTestingPeriod(currentTime)) {
+                testingRewardSum += reward;
+                testingSteps++;
+            }
+            // Zapisz model po każdej aktualizacji
+            saveModel();
+        }
+    
+        //wybiera akcję z najwyższą wartością Q dla danego stanu
+        private int selectAction(int state) {
+            int bestAction = 0;
+            double bestQ = Q_TABLE[state][0];
+            for (int i = 1; i < numActions; i++) {
+                if (Q_TABLE[state][i] > bestQ) {
+                    bestQ = Q_TABLE[state][i];
+                    bestAction = i;
+                }
+            }
+            return bestAction;
+        }
+        //zwraca najwyższą wartość Q dla danego stanu
+        private double getMaxQ(int state) {
+            double maxQ = Q_TABLE[state][0];
+            for (int i = 1; i < numActions; i++) {
+                if (Q_TABLE[state][i] > maxQ) {
+                    maxQ = Q_TABLE[state][i];
+                }
+            }
+            return maxQ;
+        }
+    
+        private boolean isTrainingPeriod(long time) {
+            int year = getYear(time);
+            return year <= TRAINING_PERIOD_END_YEAR;
+        }
+    
+        private boolean isTestingPeriod(long time) {
+            int year = getYear(time);
+            return year == TESTING_PERIOD_YEAR;
+        }
+    
+        private int getMonth(long time) {
+            Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
+            calendar.setTimeInMillis(time);
+            return calendar.get(Calendar.MONTH) + 1;
+        }
+    
+        private int getYear(long time) {
+            Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone("UTC"));
+            calendar.setTimeInMillis(time);
+            return calendar.get(Calendar.YEAR);
+        }
+    
+        // Metoda do zapisywania modelu do pliku
+        private void saveModel() {
+            try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(Q_TABLE_FILE))) {
+                oos.writeObject(Q_TABLE);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+    
+        // Metoda do wczytywania modelu z pliku
+        private void loadModel() {
+            File file = new File(Q_TABLE_FILE);
+            if (file.exists()) {
+                try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(file))) {
+                    Q_TABLE = (double[][]) ois.readObject();
+                } catch (IOException | ClassNotFoundException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+    }
+
+    @Override
+    public void onStop() throws JFException {
+    }
+
+    @Override
+    public void onTick(Instrument instrument, ITick tick) throws JFException {
+        // Nie używane w tej implementacji
+    }
+
+    @Override
+    public void onMessage(IMessage message) throws JFException {
+        // Nie używane w tej implementacji
+    }
+
+    @Override
+    public void onAccount(IAccount account) throws JFException {
+        // Nie używane w tej implementacji
+    }
+}
